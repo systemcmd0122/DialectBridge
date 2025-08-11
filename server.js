@@ -72,7 +72,7 @@ app.get('/', (req, res) => {
     // JSON レスポンスを返す
     res.status(200).json({
       message: '九州方言翻訳API',
-      version: '2.0.0',
+      version: '2.1.0',
       status: 'running',
       server_uptime: process.uptime(),
       memory_usage: process.memoryUsage(),
@@ -90,7 +90,8 @@ app.get('/', (req, res) => {
         'GET /api/keep-alive',
         'GET /api/stats',
         'POST /api/translate',
-        'POST /api/translate/batch'
+        'POST /api/translate/batch',
+        'POST /api/translate/detect'
       ],
       documentation: 'README.mdを参照してください'
     });
@@ -213,7 +214,7 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    version: '2.0.0',
+    version: '2.1.0',
     gemini_configured: !!process.env.GEMINI_API_KEY,
     supported_dialects_count: supportedDialects.length,
     server_uptime: uptime,
@@ -307,6 +308,114 @@ ${dialectName}: ${text}
   } catch (error) {
     console.error('Gemini API Error:', error);
     throw new Error(`翻訳エラー: ${error.message}`);
+  }
+}
+
+// 方言判定と翻訳を行うGemini関数（新機能）
+async function detectDialectAndTranslate(text) {
+  try {
+    if (!process.env.GEMINI_API_KEY) {
+      throw new Error('GEMINI_API_KEY が設定されていません');
+    }
+
+    if (!genAI) {
+      genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    }
+
+    const model = genAI.getGenerativeModel({ 
+      model: "gemini-2.0-flash-exp",
+      generationConfig: {
+        temperature: 0.3, // 判定の精度を上げるため温度を下げる
+        topK: 40,
+        topP: 0.95,
+        maxOutputTokens: 1024,
+      }
+    });
+
+    // 方言判定と翻訳を同時に行うプロンプト
+    const dialectList = supportedDialects.map(d => `- ${d.code}: ${d.name}`).join('\n');
+    
+    const prompt = `あなたは九州地方の方言の専門家です。以下のテキストを分析し、どの九州方言か判定してから標準語に翻訳してください。
+
+対応方言:
+${dialectList}
+
+重要な指示:
+1. まず、テキストがどの九州方言かを判定してください
+2. 判定が困難な場合は「unknown」とし、一般的な九州弁として扱ってください
+3. その後、標準語に翻訳してください
+4. 以下のJSON形式で回答してください（他の文章は含めないでください）:
+
+{
+  "detected_dialect": "方言コード（例: fukuoka, kumamoto, unknown等）",
+  "dialect_name": "方言名（例: 福岡弁、熊本弁、九州弁等）",
+  "confidence": "判定の信頼度（high, medium, low）",
+  "translated_text": "標準語に翻訳されたテキスト",
+  "original_text": "元のテキスト"
+}
+
+分析対象テキスト: ${text}`;
+
+    console.log('Gemini API（方言判定）呼び出し開始');
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    console.log('Gemini API（方言判定）呼び出し完了');
+    
+    const responseText = response.text().trim();
+    
+    try {
+      // JSONレスポンスをパース
+      const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        throw new Error('JSON形式のレスポンスが見つかりません');
+      }
+      
+      const parsedResponse = JSON.parse(jsonMatch[0]);
+      
+      // レスポンスの検証
+      if (!parsedResponse.detected_dialect || !parsedResponse.translated_text) {
+        throw new Error('不完全なレスポンス');
+      }
+      
+      // 方言コードの正規化
+      let dialectCode = parsedResponse.detected_dialect.toLowerCase();
+      let dialectName = parsedResponse.dialect_name;
+      
+      // 対応方言リストにない場合は「unknown」に設定
+      const validDialect = supportedDialects.find(d => d.code === dialectCode);
+      if (!validDialect && dialectCode !== 'unknown') {
+        dialectCode = 'unknown';
+        dialectName = '九州弁（詳細不明）';
+      }
+      
+      return {
+        detected_dialect: dialectCode,
+        dialect_name: dialectName,
+        confidence: parsedResponse.confidence || 'medium',
+        translated_text: parsedResponse.translated_text,
+        original_text: text
+      };
+      
+    } catch (parseError) {
+      console.error('JSON解析エラー:', parseError);
+      console.error('Raw response:', responseText);
+      
+      // JSON解析に失敗した場合のフォールバック
+      // 単純な九州弁として標準語に翻訳
+      const fallbackTranslation = await translateWithGemini(text, 'dialect', 'standard', 'fukuoka');
+      
+      return {
+        detected_dialect: 'unknown',
+        dialect_name: '九州弁（詳細不明）',
+        confidence: 'low',
+        translated_text: fallbackTranslation,
+        original_text: text
+      };
+    }
+    
+  } catch (error) {
+    console.error('Dialect Detection Error:', error);
+    throw new Error(`方言判定エラー: ${error.message}`);
   }
 }
 
@@ -518,6 +627,64 @@ app.post('/api/translate/batch', async (req, res) => {
   }
 });
 
+// 方言自動判定翻訳エンドポイント（新機能）
+app.post('/api/translate/detect', async (req, res) => {
+  console.log('方言自動判定翻訳リクエスト受信:', req.body);
+  
+  try {
+    const { text } = req.body;
+
+    // バリデーション
+    if (!text || typeof text !== 'string' || text.trim().length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: '翻訳するテキストが必要です'
+      });
+    }
+
+    if (text.length > 2000) {
+      return res.status(400).json({
+        success: false,
+        error: 'テキストは2000文字以下にしてください'
+      });
+    }
+
+    // 方言判定と翻訳実行
+    const startTime = Date.now();
+    const result = await detectDialectAndTranslate(text);
+    const processingTime = Date.now() - startTime;
+
+    console.log('方言自動判定翻訳完了:', {
+      original: text,
+      detected: result.detected_dialect,
+      translated: result.translated_text,
+      processingTime
+    });
+
+    res.json({
+      success: true,
+      data: {
+        original_text: result.original_text,
+        translated_text: result.translated_text,
+        detected_dialect: result.detected_dialect,
+        dialect_name: result.dialect_name,
+        confidence: result.confidence,
+        processing_time_ms: processingTime,
+        timestamp: new Date().toISOString()
+      }
+    });
+
+  } catch (error) {
+    console.error('Dialect Detection Translation Error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'サーバーエラーが発生しました',
+      message: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
 // Keep-Alive機能の実装
 function performKeepAlive() {
   if (!keepAliveUrl) {
@@ -672,7 +839,8 @@ app.use((req, res) => {
       'GET /api/keep-alive',
       'GET /api/stats',
       'POST /api/translate',
-      'POST /api/translate/batch'
+      'POST /api/translate/batch',
+      'POST /api/translate/detect'
     ],
     timestamp: new Date().toISOString()
   });
@@ -688,6 +856,7 @@ const server = app.listen(PORT, () => {
   console.log(`📚 対応方言: ${supportedDialects.map(d => d.name).join(', ')}`);
   console.log(`🔑 Gemini API Key: ${process.env.GEMINI_API_KEY ? '✅ 設定済み' : '❌ 未設定'}`);
   console.log(`🕐 起動時刻: ${new Date().toLocaleString('ja-JP')}`);
+  console.log(`🆕 新機能: 方言自動判定翻訳 (/api/translate/detect)`);
   
   // Koyeb環境でのKeep-Alive設定
   if (process.env.KOYEB_PUBLIC_DOMAIN) {
@@ -705,6 +874,7 @@ const server = app.listen(PORT, () => {
   console.log('='.repeat(80));
   console.log('📖 ブラウザで http://localhost:' + PORT + ' にアクセスしてダッシュボードを確認してください');
   console.log('📊 サーバー統計: http://localhost:' + PORT + '/api/stats');
+  console.log('🔍 方言自動判定: POST http://localhost:' + PORT + '/api/translate/detect');
   console.log('='.repeat(80));
   
   // 初期メモリ使用量ログ
