@@ -4,14 +4,38 @@ const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const path = require('path');
+const https = require('https');
+const http = require('http');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// リクエストログミドルウェア
+// Keep-Alive設定用の変数
+let keepAliveUrl = null;
+let keepAliveInterval = null;
+let lastActivityTime = Date.now();
+let activityCounter = 0;
+
+// 環境変数からKoyebの公開URLを取得
+if (process.env.KOYEB_PUBLIC_DOMAIN) {
+  keepAliveUrl = `https://${process.env.KOYEB_PUBLIC_DOMAIN}`;
+  console.log('🔄 Keep-Alive URL設定:', keepAliveUrl);
+} else if (process.env.NODE_ENV === 'production') {
+  console.warn('⚠️  KOYEB_PUBLIC_DOMAIN が設定されていません。手動でURLを設定してください。');
+}
+
+// リクエストログミドルウェア（アクティビティ追跡付き）
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
+  const timestamp = new Date().toISOString();
+  console.log(`${timestamp} - ${req.method} ${req.url} - IP: ${req.ip}`);
+  
+  // アクティビティ更新（keep-aliveリクエスト以外）
+  if (!req.url.includes('/api/keep-alive')) {
+    lastActivityTime = Date.now();
+    activityCounter++;
+  }
+  
   next();
 });
 
@@ -52,10 +76,19 @@ app.get('/', (req, res) => {
       status: 'running',
       server_uptime: process.uptime(),
       memory_usage: process.memoryUsage(),
+      keep_alive_status: {
+        enabled: !!keepAliveUrl,
+        url: keepAliveUrl,
+        last_activity: new Date(lastActivityTime).toISOString(),
+        activity_count: activityCounter,
+        minutes_since_last_activity: Math.floor((Date.now() - lastActivityTime) / 60000)
+      },
       timestamp: new Date().toISOString(),
       endpoints: [
         'GET /api/health',
         'GET /api/dialects',
+        'GET /api/keep-alive',
+        'GET /api/stats',
         'POST /api/translate',
         'POST /api/translate/batch'
       ],
@@ -77,13 +110,17 @@ app.get('/', (req, res) => {
   }
 });
 
-// レート制限設定
+// レート制限設定（keep-aliveエンドポイントを除外）
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15分
   max: 100,
   message: { 
     success: false,
     error: 'レート制限に達しました。しばらく待ってから再度お試しください。' 
+  },
+  skip: (req) => {
+    // keep-aliveエンドポイントはレート制限から除外
+    return req.url === '/api/keep-alive';
   }
 });
 app.use('/api/', limiter);
@@ -112,17 +149,83 @@ const supportedDialects = [
   { code: 'saga', name: '佐賀弁' }
 ];
 
-// ヘルスチェック
+// Keep-Alive エンドポイント（軽量なレスポンス）
+app.get('/api/keep-alive', (req, res) => {
+  const timestamp = Date.now();
+  const uptime = process.uptime();
+  
+  res.status(200).json({
+    status: 'alive',
+    timestamp: new Date(timestamp).toISOString(),
+    uptime_seconds: Math.floor(uptime),
+    uptime_formatted: formatUptime(uptime),
+    memory_mb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+    last_real_activity: new Date(lastActivityTime).toISOString(),
+    activity_count: activityCounter,
+    keep_alive_ping: true
+  });
+});
+
+// サーバー統計エンドポイント
+app.get('/api/stats', (req, res) => {
+  const uptime = process.uptime();
+  const memUsage = process.memoryUsage();
+  
+  res.json({
+    success: true,
+    server_stats: {
+      status: 'running',
+      uptime_seconds: Math.floor(uptime),
+      uptime_formatted: formatUptime(uptime),
+      memory_usage: {
+        rss_mb: Math.round(memUsage.rss / 1024 / 1024),
+        heap_used_mb: Math.round(memUsage.heapUsed / 1024 / 1024),
+        heap_total_mb: Math.round(memUsage.heapTotal / 1024 / 1024),
+        external_mb: Math.round(memUsage.external / 1024 / 1024)
+      },
+      activity: {
+        last_activity: new Date(lastActivityTime).toISOString(),
+        activity_count: activityCounter,
+        minutes_since_last_activity: Math.floor((Date.now() - lastActivityTime) / 60000)
+      },
+      keep_alive: {
+        enabled: !!keepAliveUrl,
+        url: keepAliveUrl,
+        interval_active: !!keepAliveInterval
+      },
+      environment: {
+        node_version: process.version,
+        platform: process.platform,
+        arch: process.arch,
+        is_production: process.env.NODE_ENV === 'production'
+      }
+    },
+    timestamp: new Date().toISOString()
+  });
+});
+
+// ヘルスチェック（拡張版）
 app.get('/api/health', (req, res) => {
   console.log('ヘルスチェック実行');
+  const uptime = process.uptime();
+  const memUsage = process.memoryUsage();
+  
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
     version: '2.0.0',
     gemini_configured: !!process.env.GEMINI_API_KEY,
     supported_dialects_count: supportedDialects.length,
-    server_uptime: process.uptime(),
-    memory_usage: process.memoryUsage()
+    server_uptime: uptime,
+    uptime_formatted: formatUptime(uptime),
+    memory_usage: {
+      rss_mb: Math.round(memUsage.rss / 1024 / 1024),
+      heap_used_mb: Math.round(memUsage.heapUsed / 1024 / 1024),
+      heap_total_mb: Math.round(memUsage.heapTotal / 1024 / 1024)
+    },
+    keep_alive_active: !!keepAliveInterval,
+    last_activity: new Date(lastActivityTime).toISOString(),
+    activity_count: activityCounter
   });
 });
 
@@ -415,6 +518,136 @@ app.post('/api/translate/batch', async (req, res) => {
   }
 });
 
+// Keep-Alive機能の実装
+function performKeepAlive() {
+  if (!keepAliveUrl) {
+    console.log('⚠️  Keep-Alive URL が設定されていません');
+    return;
+  }
+
+  const url = `${keepAliveUrl}/api/keep-alive`;
+  const protocol = keepAliveUrl.startsWith('https') ? https : http;
+  
+  const options = {
+    method: 'GET',
+    timeout: 30000,
+    headers: {
+      'User-Agent': 'KeepAlive/1.0',
+      'Accept': 'application/json'
+    }
+  };
+
+  console.log(`🔄 Keep-Alive ping実行中... ${url}`);
+  
+  const req = protocol.get(url, options, (res) => {
+    let data = '';
+    res.on('data', chunk => data += chunk);
+    res.on('end', () => {
+      if (res.statusCode === 200) {
+        try {
+          const response = JSON.parse(data);
+          console.log(`✅ Keep-Alive成功 - Uptime: ${response.uptime_formatted || 'N/A'}`);
+        } catch (e) {
+          console.log('✅ Keep-Alive成功 (JSON解析失敗)');
+        }
+      } else {
+        console.log(`⚠️  Keep-Alive警告: HTTP ${res.statusCode}`);
+      }
+    });
+  });
+
+  req.on('error', (error) => {
+    console.error('❌ Keep-Alive エラー:', error.message);
+  });
+
+  req.on('timeout', () => {
+    req.destroy();
+    console.error('❌ Keep-Alive タイムアウト');
+  });
+}
+
+// Keep-Aliveの開始
+function startKeepAlive() {
+  if (keepAliveInterval) {
+    console.log('Keep-Alive は既に実行中です');
+    return;
+  }
+
+  if (!keepAliveUrl) {
+    console.log('⚠️  Keep-Alive URL が未設定のためスキップします');
+    return;
+  }
+
+  // 最初のpingは5分後
+  setTimeout(() => {
+    performKeepAlive();
+    
+    // その後は14分間隔で実行（15分のタイムアウトを回避）
+    keepAliveInterval = setInterval(() => {
+      performKeepAlive();
+    }, 14 * 60 * 1000); // 14分 = 840,000ms
+    
+  }, 5 * 60 * 1000); // 5分後に開始
+
+  console.log('🔄 Keep-Alive スケジューラを開始しました（14分間隔）');
+}
+
+// Keep-Aliveの停止
+function stopKeepAlive() {
+  if (keepAliveInterval) {
+    clearInterval(keepAliveInterval);
+    keepAliveInterval = null;
+    console.log('🛑 Keep-Alive を停止しました');
+  }
+}
+
+// アップタイム表示用のフォーマット関数
+function formatUptime(seconds) {
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = Math.floor(seconds % 60);
+  
+  if (days > 0) {
+    return `${days}日 ${hours}時間 ${minutes}分 ${secs}秒`;
+  } else if (hours > 0) {
+    return `${hours}時間 ${minutes}分 ${secs}秒`;
+  } else if (minutes > 0) {
+    return `${minutes}分 ${secs}秒`;
+  } else {
+    return `${secs}秒`;
+  }
+}
+
+// 定期的なメモリ使用量ログ
+function logMemoryUsage() {
+  const memUsage = process.memoryUsage();
+  const uptime = process.uptime();
+  
+  console.log('📊 サーバー状況レポート:');
+  console.log(`   稼働時間: ${formatUptime(uptime)}`);
+  console.log(`   メモリ使用量: ${Math.round(memUsage.rss / 1024 / 1024)}MB`);
+  console.log(`   アクティビティ数: ${activityCounter}`);
+  console.log(`   最終アクティビティ: ${Math.floor((Date.now() - lastActivityTime) / 60000)}分前`);
+  console.log(`   Keep-Alive状態: ${keepAliveInterval ? '🟢 有効' : '🔴 無効'}`);
+}
+
+// 30分ごとにメモリ使用量をログ出力
+setInterval(logMemoryUsage, 30 * 60 * 1000);
+
+// プロセス終了時のクリーンアップ
+process.on('SIGINT', () => {
+  console.log('\n🛑 サーバー終了処理を開始...');
+  stopKeepAlive();
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.log('\n🛑 サーバー終了処理を開始...');
+  stopKeepAlive();
+  process.exit(0);
+});
+
 // エラーハンドリングミドルウェア
 app.use((error, req, res, next) => {
   console.error('Unhandled Error:', error);
@@ -435,7 +668,9 @@ app.use((req, res) => {
     available_endpoints: [
       'GET /',
       'GET /api/health',
-      'GET /api/dialects', 
+      'GET /api/dialects',
+      'GET /api/keep-alive',
+      'GET /api/stats',
       'POST /api/translate',
       'POST /api/translate/batch'
     ],
@@ -444,16 +679,38 @@ app.use((req, res) => {
 });
 
 // サーバー起動
-app.listen(PORT, () => {
-  console.log('='.repeat(60));
+const server = app.listen(PORT, () => {
+  console.log('='.repeat(80));
   console.log('🚀 九州方言翻訳API サーバーが起動しました');
-  console.log('='.repeat(60));
+  console.log('='.repeat(80));
   console.log(`📍 URL: http://localhost:${PORT}`);
   console.log(`🌐 API Base: http://localhost:${PORT}/api`);
   console.log(`📚 対応方言: ${supportedDialects.map(d => d.name).join(', ')}`);
   console.log(`🔑 Gemini API Key: ${process.env.GEMINI_API_KEY ? '✅ 設定済み' : '❌ 未設定'}`);
   console.log(`🕐 起動時刻: ${new Date().toLocaleString('ja-JP')}`);
-  console.log('='.repeat(60));
+  
+  // Koyeb環境でのKeep-Alive設定
+  if (process.env.KOYEB_PUBLIC_DOMAIN) {
+    keepAliveUrl = `https://${process.env.KOYEB_PUBLIC_DOMAIN}`;
+    console.log(`🔄 Keep-Alive URL: ${keepAliveUrl}`);
+    console.log(`🔄 Keep-Alive 間隔: 14分`);
+    
+    // Keep-Alive開始
+    startKeepAlive();
+  } else if (process.env.NODE_ENV === 'production') {
+    console.log('⚠️  本番環境ですが KOYEB_PUBLIC_DOMAIN が未設定です');
+    console.log('⚠️  Koyebの環境変数にドメインを設定してください');
+  }
+  
+  console.log('='.repeat(80));
   console.log('📖 ブラウザで http://localhost:' + PORT + ' にアクセスしてダッシュボードを確認してください');
-  console.log('='.repeat(60));
+  console.log('📊 サーバー統計: http://localhost:' + PORT + '/api/stats');
+  console.log('='.repeat(80));
+  
+  // 初期メモリ使用量ログ
+  setTimeout(logMemoryUsage, 10000); // 10秒後
 });
+
+// サーバーのKeep-Alive設定
+server.keepAliveTimeout = 65000; // 65秒
+server.headersTimeout = 66000; // 66秒
