@@ -12,18 +12,12 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Keep-Alive設定用の変数
-let keepAliveUrl = null;
+let keepAliveUrl = 'https://yammering-nevsa-tisk0122-af0d41bb.koyeb.app'; // 固定URL
 let keepAliveInterval = null;
 let lastActivityTime = Date.now();
 let activityCounter = 0;
 
-// 環境変数からKoyebの公開URLを取得
-if (process.env.KOYEB_PUBLIC_DOMAIN) {
-  keepAliveUrl = `https://${process.env.KOYEB_PUBLIC_DOMAIN}`;
-  console.log('🔄 Keep-Alive URL設定:', keepAliveUrl);
-} else if (process.env.NODE_ENV === 'production') {
-  console.warn('⚠️  KOYEB_PUBLIC_DOMAIN が設定されていません。手動でURLを設定してください。');
-}
+console.log('🔄 Keep-Alive URL設定:', keepAliveUrl);
 
 // リクエストログミドルウェア（アクティビティ追跡付き）
 app.use((req, res, next) => {
@@ -311,7 +305,7 @@ ${dialectName}: ${text}
   }
 }
 
-// 方言判定と翻訳を行うGemini関数（新機能）
+// 方言判定と翻訳を行うGemini関数
 async function detectDialectAndTranslate(text) {
   try {
     if (!process.env.GEMINI_API_KEY) {
@@ -627,7 +621,7 @@ app.post('/api/translate/batch', async (req, res) => {
   }
 });
 
-// 方言自動判定翻訳エンドポイント（新機能）
+// 方言自動判定翻訳エンドポイント
 app.post('/api/translate/detect', async (req, res) => {
   console.log('方言自動判定翻訳リクエスト受信:', req.body);
   
@@ -733,7 +727,7 @@ function performKeepAlive() {
   });
 }
 
-// Keep-Aliveの開始
+// Keep-Aliveの開始（常時有効）
 function startKeepAlive() {
   if (keepAliveInterval) {
     console.log('Keep-Alive は既に実行中です');
@@ -853,28 +847,25 @@ const server = app.listen(PORT, () => {
   console.log('='.repeat(80));
   console.log(`📍 URL: http://localhost:${PORT}`);
   console.log(`🌐 API Base: http://localhost:${PORT}/api`);
+  console.log(`🌐 Koyeb URL: ${keepAliveUrl}`);
   console.log(`📚 対応方言: ${supportedDialects.map(d => d.name).join(', ')}`);
   console.log(`🔑 Gemini API Key: ${process.env.GEMINI_API_KEY ? '✅ 設定済み' : '❌ 未設定'}`);
   console.log(`🕐 起動時刻: ${new Date().toLocaleString('ja-JP')}`);
   console.log(`🆕 新機能: 方言自動判定翻訳 (/api/translate/detect)`);
   
-  // Koyeb環境でのKeep-Alive設定
-  if (process.env.KOYEB_PUBLIC_DOMAIN) {
-    keepAliveUrl = `https://${process.env.KOYEB_PUBLIC_DOMAIN}`;
-    console.log(`🔄 Keep-Alive URL: ${keepAliveUrl}`);
-    console.log(`🔄 Keep-Alive 間隔: 14分`);
-    
-    // Keep-Alive開始
-    startKeepAlive();
-  } else if (process.env.NODE_ENV === 'production') {
-    console.log('⚠️  本番環境ですが KOYEB_PUBLIC_DOMAIN が未設定です');
-    console.log('⚠️  Koyebの環境変数にドメインを設定してください');
-  }
+  // Keep-Alive設定（常時有効）
+  console.log(`🔄 Keep-Alive URL: ${keepAliveUrl}`);
+  console.log(`🔄 Keep-Alive 間隔: 14分`);
+  console.log(`🔄 Keep-Alive: 常時有効モード`);
+  
+  // Keep-Alive開始
+  startKeepAlive();
   
   console.log('='.repeat(80));
   console.log('📖 ブラウザで http://localhost:' + PORT + ' にアクセスしてダッシュボードを確認してください');
-  console.log('📊 サーバー統計: http://localhost:' + PORT + '/api/stats');
-  console.log('🔍 方言自動判定: POST http://localhost:' + PORT + '/api/translate/detect');
+  console.log('📊 サーバー統計: ' + keepAliveUrl + '/api/stats');
+  console.log('🔍 方言自動判定: POST ' + keepAliveUrl + '/api/translate/detect');
+  console.log('🔄 Keep-Alive確認: ' + keepAliveUrl + '/api/keep-alive');
   console.log('='.repeat(80));
   
   // 初期メモリ使用量ログ
